@@ -1,15 +1,32 @@
 #include <WiFi.h>
 
 // --- WIFI ---
-const char* ssid     = "NombreRED";
+const char* ssid     = "WifiRED";
 const char* password = "ContraseñaRED";
 
-// --- SERVIDOR TCP (tu PC)  ---
+// --- SERVIDOR TCP (tu PC) ---
 const char* serverIP = "192.168.1.84";
 const uint16_t serverPort = 5000;
 
 WiFiClient client;
 
+// ------------------------------
+//  ESTRUCTURA ETIQUETA 
+// ------------------------------
+struct Etiqueta {
+  bool configurada = false;
+  int id = -1;
+  String temporada = "";
+  String tipo = "";
+  String ubicacion = "";
+  float precio = 0.0f;
+};
+
+Etiqueta etiqueta; // etiqueta actual (arranca vacía)
+
+// ------------------------------
+//  CONEXIÓN WIFI / TCP
+// ------------------------------
 bool conectarWiFi(unsigned long timeoutMs = 20000) {
   Serial.println("\n[WIFI] Conectando...");
   Serial.print("[WIFI] SSID: ");
@@ -29,13 +46,9 @@ bool conectarWiFi(unsigned long timeoutMs = 20000) {
     Serial.println("[WIFI] ✅ Conectado");
     Serial.print("[WIFI] IP: ");
     Serial.println(WiFi.localIP());
-    Serial.print("[WIFI] RSSI: ");
-    Serial.println(WiFi.RSSI());
     return true;
   } else {
     Serial.println("[WIFI] ❌ No se pudo conectar (timeout)");
-    Serial.print("[WIFI] Estado: ");
-    Serial.println((int)WiFi.status());
     return false;
   }
 }
@@ -47,7 +60,7 @@ bool conectarServidor(unsigned long timeoutMs = 5000) {
   Serial.print(":");
   Serial.println(serverPort);
 
-  client.stop(); // por si había algo viejo
+  client.stop();
 
   unsigned long start = millis();
   while (!client.connect(serverIP, serverPort) && (millis() - start) < timeoutMs) {
@@ -57,7 +70,7 @@ bool conectarServidor(unsigned long timeoutMs = 5000) {
   Serial.println();
 
   if (client.connected()) {
-    Serial.println("[TCP] ✅ Conectado al servidor");
+    Serial.println("[TCP] ✅ Conectado al servidor (conexión persistente)");
     return true;
   } else {
     Serial.println("[TCP] ❌ No se pudo conectar al servidor (timeout)");
@@ -70,31 +83,25 @@ void setup() {
   delay(300);
 
   Serial.println("\n=== ESP32 WiFi + TCP (MINIMO) ===");
+  Serial.println("[ETIQUETA] Estado inicial: VACÍA (sin configurar)");
 
-  // 1) WiFi
-  if (!conectarWiFi()) {
-    Serial.println("[BOOT] Reintentará en loop.");
-    return;
+  if (conectarWiFi()) {
+    conectarServidor();
   }
-
-  // 2) TCP
-  conectarServidor();
 }
 
 void loop() {
-  // Si se cae el WiFi, reintenta
+  // Si se cae WiFi, reintenta
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("\n[WIFI] ⚠️ WiFi desconectado. Reintentando...");
-    conectarWiFi();
-    // tras recuperar WiFi, intentamos servidor
-    if (WiFi.status() == WL_CONNECTED) {
+    if (conectarWiFi()) {
       conectarServidor();
     }
     delay(1000);
     return;
   }
 
-  // Si se cae TCP, reintenta cada 2s
+  // Si se cae TCP, reintenta
   if (!client.connected()) {
     Serial.println("\n[TCP] ⚠️ Servidor desconectado. Reintentando...");
     conectarServidor();
@@ -102,6 +109,6 @@ void loop() {
     return;
   }
 
-  // Mantener vivo.
+  // Conexión OK
   delay(1000);
 }
