@@ -4,7 +4,7 @@
 const char* ssid     = "NombreRED";
 const char* password = "ContraseñaRED";
 
-// --- SERVIDOR TCP (tu PC) ---
+// --- SERVIDOR TCP (tu PC)  ---
 const char* serverIP = "192.168.1.84";
 const uint16_t serverPort = 5000;
 
