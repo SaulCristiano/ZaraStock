@@ -1,21 +1,28 @@
 import socket
 import json
 import threading
+import time
 
 HOST = "0.0.0.0"
 PORT = 5000
 
-client_lock = threading.Lock()
-client_conn = None
-client_addr = None
+clients_lock = threading.Lock()
+clients = {}  # cid -> {"conn": conn, "addr": addr}
+
+cid_lock = threading.Lock()
+next_cid = 1
 
 
 def send_line(conn: socket.socket, text: str):
     conn.sendall((text + "\n").encode("utf-8"))
 
 
-def rx_thread(conn: socket.socket, addr):
-    """Lee líneas del cliente y las imprime (ACK, etc.)."""
+def rx_thread(cid: int):
+    """Recibe líneas del cliente y las imprime. Si se desconecta, lo elimina."""
+    with clients_lock:
+        conn = clients[cid]["conn"]
+        addr = clients[cid]["addr"]
+
     buf = b""
     try:
         while True:
@@ -27,43 +34,43 @@ def rx_thread(conn: socket.socket, addr):
                 line, buf = buf.split(b"\n", 1)
                 msg = line.decode("utf-8", errors="ignore").strip()
                 if msg:
-                    print(f"\n[RX {addr}] {msg}")
+                    print(f"\n[CID {cid} | {addr[0]}:{addr[1]}] {msg}")
     except Exception as e:
-        print(f"\n[RX] Error: {e}")
+        print(f"\n[CID {cid}] Error RX: {e}")
     finally:
-        with client_lock:
-            global client_conn, client_addr
-            client_conn = None
-            client_addr = None
         try:
             conn.close()
         except:
             pass
-        print("\nCliente desconectado.")
+        with clients_lock:
+            clients.pop(cid, None)
+        print(f"\n[CID {cid}] Cliente desconectado ({addr[0]}:{addr[1]})")
 
 
-def accept_one_client():
-    global client_conn, client_addr
+def acceptor_thread():
+    global next_cid
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(20)
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((HOST, PORT))
-        server.listen(1)
-        print(f"Servidor TCP escuchando en {HOST}:{PORT}")
-        print("Esperando a que se conecte una etiqueta...\n")
+    print(f"Servidor TCP escuchando en {HOST}:{PORT}")
+    print("Aceptando múltiples conexiones...\n")
 
+    while True:
         conn, addr = server.accept()
-        with client_lock:
-            client_conn = conn
-            client_addr = addr
 
-        print(f"Cliente conectado desde {addr}")
+        with cid_lock:
+            cid = next_cid
+            next_cid += 1
 
-        t = threading.Thread(target=rx_thread, args=(conn, addr), daemon=True)
+        with clients_lock:
+            clients[cid] = {"conn": conn, "addr": addr}
+
+        print(f"[+] Conectado CID {cid} desde {addr[0]}:{addr[1]}")
+
+        t = threading.Thread(target=rx_thread, args=(cid,), daemon=True)
         t.start()
-
-        # Mantener el hilo principal vivo con el menú
-        menu_loop()
 
 
 def pedir_float(prompt):
@@ -75,18 +82,50 @@ def pedir_float(prompt):
             print("Número inválido. Ejemplo: 19.99")
 
 
-def configurar_etiqueta():
-    with client_lock:
-        conn = client_conn
-        addr = client_addr
+def listar_clientes():
+    with clients_lock:
+        if not clients:
+            print("No hay clientes conectados.")
+            return
+        print("\nClientes conectados:")
+        for cid, info in clients.items():
+            a = info["addr"]
+            print(f"  CID {cid} -> {a[0]}:{a[1]}")
 
-    if conn is None:
+
+def elegir_cid():
+    while True:
+        listar_clientes()
+        s = input("\nElige CID: ").strip()
+        try:
+            cid = int(s)
+        except:
+            print("CID inválido (debe ser número).")
+            continue
+
+        with clients_lock:
+            if cid in clients:
+                return cid
+
+        print("Ese CID no existe (quizá se desconectó).")
+
+
+def configurar_etiqueta():
+    with clients_lock:
+        hay = bool(clients)
+    if not hay:
         print("No hay ninguna etiqueta conectada.")
         return
 
+    cid = elegir_cid()
+
     print("\n--- CONFIGURAR ETIQUETA ---")
-    # Campos manuales (como en tu versión original)
-    id_ = int(input("ID (int): ").strip())
+    try:
+        id_ = int(input("ID (int): ").strip())
+    except:
+        print("ID inválido.")
+        return
+
     temporada = input("Temporada (Invierno/Verano): ").strip()
     tipo = input("Tipo (Gorra/Camiseta/Pantalones/Calcetines): ").strip()
     ubicacion = input("Ubicacion (almacén/tienda): ").strip()
@@ -103,10 +142,18 @@ def configurar_etiqueta():
     payload = json.dumps(tag, ensure_ascii=False)
     cmd = f"SET {payload}"
 
+    with clients_lock:
+        conn = clients.get(cid, {}).get("conn")
+        addr = clients.get(cid, {}).get("addr")
+
+    if conn is None:
+        print("Ese CID ya no está conectado.")
+        return
+
     try:
         send_line(conn, cmd)
-        print(f"Enviado a {addr}: {cmd}")
-        print("Esperando ACK en consola (si llega)...")
+        print(f"Enviado a CID {cid} ({addr[0]}:{addr[1]}): {cmd}")
+        print("Si el dispositivo responde, verás ACK/NACK en consola.")
     except Exception as e:
         print("No se pudo enviar:", e)
 
@@ -114,25 +161,30 @@ def configurar_etiqueta():
 def menu_loop():
     while True:
         print("\n--- MENÚ SERVIDOR ---")
-        print("1) Configurar etiqueta (enviar SET)")
+        print("1) Configurar etiqueta (enviar SET a un CID)")
+        print("2) Ver clientes conectados")
         print("0) Salir")
         op = input("Opción: ").strip()
 
         if op == "1":
             configurar_etiqueta()
+        elif op == "2":
+            listar_clientes()
         elif op == "0":
-            print("Saliendo (cerrando servidor).")
-            with client_lock:
-                conn = client_conn
-            try:
-                if conn:
-                    conn.close()
-            except:
-                pass
+            print("Saliendo.")
             break
         else:
             print("Opción no válida.")
 
 
+def main():
+    t = threading.Thread(target=acceptor_thread, daemon=True)
+    t.start()
+
+    # Espera pequeñita para que salga el banner antes del menú (opcional)
+    time.sleep(0.1)
+    menu_loop()
+
+
 if __name__ == "__main__":
-    accept_one_client()
+    main()
