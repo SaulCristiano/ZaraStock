@@ -3,6 +3,9 @@ import threading
 import json
 import time
 import os
+import re
+import csv
+from datetime import datetime
 
 HOST = "0.0.0.0"
 PORT = 5000
@@ -18,21 +21,95 @@ ping_lock = threading.Lock()
 ping_responses = {}  # rid -> dict(cid -> dict(status, data_json_or_none, raw))
 
 
+# ------------------ Utilidades ------------------
+
 def now_ts():
     return time.strftime("%H:%M:%S")
 
+def now_iso():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# --- ANSI simple (Windows Terminal/VSCode suele soportar). Si no, se verá sin colores igualmente ---
 def c(txt, code):
     return f"\x1b[{code}m{txt}\x1b[0m"
 
 def clear():
     os.system("cls" if os.name == "nt" else "clear")
 
-
 def send_line(conn: socket.socket, text: str):
     conn.sendall((text + "\n").encode("utf-8", errors="ignore"))
 
+
+# ------------------ CSV Logging ------------------
+
+MOV_CSV = "movimientos.csv"
+VEN_CSV = "ventas.csv"
+
+def append_csv(filename: str, headers: list[str], row: dict):
+    file_exists = os.path.exists(filename)
+    with open(filename, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
+
+def read_last_rows(filename: str, limit: int = 20):
+    if not os.path.exists(filename):
+        return [], []
+    with open(filename, "r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        rows = list(r)
+        headers = r.fieldnames or []
+    return headers, rows[-limit:]
+
+
+# ------------------ Tabla bonita (ANSI-safe) ------------------
+
+def normalize_rows(rows, cols, fill="-"):
+    out = []
+    for r in rows:
+        r = list(r)
+        if len(r) < cols:
+            r += [fill] * (cols - len(r))
+        elif len(r) > cols:
+            r = r[:cols]
+        out.append(r)
+    return out
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", str(s))
+
+def visible_len(s: str) -> int:
+    return len(strip_ansi(s))
+
+def pad_visible(s: str, width: int) -> str:
+    s = str(s)
+    return s + (" " * max(0, width - visible_len(s)))
+
+def _table(rows, headers):
+    cols = len(headers)
+    rows = normalize_rows(rows, cols, fill="-")
+
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i in range(cols):
+            widths[i] = max(widths[i], visible_len(r[i]))
+
+    def line(sep="-", cross="+"):
+        return cross + cross.join(sep * (w + 2) for w in widths) + cross
+
+    out = []
+    out.append(line("-"))
+    out.append("| " + " | ".join(headers[i].ljust(widths[i]) for i in range(cols)) + " |")
+    out.append(line("="))
+    for r in rows:
+        out.append("| " + " | ".join(pad_visible(r[i], widths[i]) for i in range(cols)) + " |")
+    out.append(line("-"))
+    return "\n".join(out)
+
+
+# ------------------ Networking ------------------
 
 def handle_client(client_id: int):
     with clients_lock:
@@ -54,7 +131,6 @@ def handle_client(client_id: int):
                 clients[client_id]["buffer"] += data
                 buf = clients[client_id]["buffer"]
 
-            # Procesar por líneas fuera del lock (para no bloquear a otros)
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 msg = line.decode("utf-8", errors="ignore").strip()
@@ -79,15 +155,12 @@ def handle_client(client_id: int):
 
 
 def process_message(client_id: int, msg: str):
-    # Log básico (puedes comentar si molesta)
     with clients_lock:
         addr = clients[client_id]["addr"] if client_id in clients else ("?", 0)
+
     print(f"[{now_ts()}] [{addr}] {msg}")
 
-    # Capturar respuestas al PING:
-    # Formato esperado:
-    #   PONG <rid> EMPTY
-    #   PONG <rid> DATA {json}
+    # ----- PING/PONG para ver stock -----
     if msg.startswith("PONG "):
         parts = msg.split(" ", 3)  # PONG rid STATUS [rest]
         if len(parts) >= 3:
@@ -97,7 +170,7 @@ def process_message(client_id: int, msg: str):
 
             data_json = None
             if status == "DATA" and rest:
-                data_json = rest  # { ... }
+                data_json = rest
 
             with ping_lock:
                 if rid not in ping_responses:
@@ -109,11 +182,62 @@ def process_message(client_id: int, msg: str):
                 }
         return
 
-    # ACK del SET (opcional)
+    # ----- Alta (ACK) -----
     if msg.startswith("ACK"):
         return
 
-    # OK / eventos
+    # ----- Reset manual -----
+    if msg.startswith("RESET"):
+        # No hace falta guardar; el broadcast ya lo verá.
+        return
+
+    # ----- Movimiento -----
+    # Formato: MOVE {json}
+    if msg.startswith("MOVE "):
+        payload = msg[5:].strip()
+        try:
+            d = json.loads(payload)
+            append_csv(
+                MOV_CSV,
+                headers=["timestamp", "ip", "id", "temporada", "tipo", "from", "to", "precio"],
+                row={
+                    "timestamp": now_iso(),
+                    "ip": addr[0],
+                    "id": d.get("ID", ""),
+                    "temporada": d.get("Temporada", ""),
+                    "tipo": d.get("Tipo", ""),
+                    "from": d.get("From", ""),
+                    "to": d.get("To", ""),
+                    "precio": d.get("Precio", ""),
+                }
+            )
+        except Exception as e:
+            print(f"[{now_ts()}] [!] MOVE mal formado: {e}")
+        return
+
+    # ----- Venta -----
+    # Formato: SOLD {json}
+    if msg.startswith("SOLD "):
+        payload = msg[5:].strip()
+        try:
+            d = json.loads(payload)
+            append_csv(
+                VEN_CSV,
+                headers=["timestamp", "ip", "id", "temporada", "tipo", "precio"],
+                row={
+                    "timestamp": now_iso(),
+                    "ip": addr[0],
+                    "id": d.get("ID", ""),
+                    "temporada": d.get("Temporada", ""),
+                    "tipo": d.get("Tipo", ""),
+                    "precio": d.get("Precio", ""),
+                }
+            )
+        except Exception as e:
+            print(f"[{now_ts()}] [!] SOLD mal formado: {e}")
+        return
+
+    # Otros mensajes
     return
 
 
@@ -142,17 +266,7 @@ def acceptor_thread():
         t.start()
 
 
-def print_clients():
-    with clients_lock:
-        if not clients:
-            print("No hay clientes conectados.")
-            return
-        print("\nClientes conectados:")
-        for cid, info in clients.items():
-            a = info["addr"]
-            conf = "✅ CONFIGURADA" if info["configured"] else "⬜ VACÍA"
-            print(f"  [{cid}] {a[0]}:{a[1]}  {conf}")
-
+# ------------------ Menú: alta ------------------
 
 def input_choice(prompt, valid):
     while True:
@@ -161,7 +275,6 @@ def input_choice(prompt, valid):
             return v
         print("Valor inválido. Opciones:", ", ".join(valid))
 
-
 def input_float(prompt):
     while True:
         s = input(prompt).strip().replace(",", ".")
@@ -169,7 +282,6 @@ def input_float(prompt):
             return float(s)
         except:
             print("Precio inválido. Ejemplo: 19.99")
-
 
 def agregar_etiqueta():
     global next_tag_id
@@ -201,7 +313,7 @@ def agregar_etiqueta():
     temporada = input_choice("Temporada (Invierno/Verano): ", {"Invierno", "Verano"})
     tipo = input_choice("Tipo (Gorra/Camiseta/Pantalones/Calcetines): ",
                         {"Gorra", "Camiseta", "Pantalones", "Calcetines"})
-    ubicacion = input_choice("Ubicación (almacén/tienda): ", {"almacén", "tienda"})
+    ubicacion = input_choice("Ubicación inicial (almacén/tienda): ", {"almacén", "tienda"})
     precio = input_float("Precio (float): ")
 
     with next_id_lock:
@@ -232,105 +344,49 @@ def agregar_etiqueta():
         print("❌ No se pudo enviar al cliente:", e)
 
 
-# --- CAMBIO: normalizador de filas para que no pete nunca ---
-def normalize_rows(rows, cols, fill="-"):
-    out = []
-    for r in rows:
-        r = list(r)
-        if len(r) < cols:
-            r += [fill] * (cols - len(r))
-        elif len(r) > cols:
-            r = r[:cols]
-        out.append(r)
-    return out
-
-import re
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-def strip_ansi(s: str) -> str:
-    return ANSI_RE.sub("", s)
-
-def visible_len(s: str) -> int:
-    return len(strip_ansi(str(s)))
-
-def pad_visible(s: str, width: int) -> str:
-    """Rellena con espacios para que el ancho VISIBLE sea 'width' (ignorando ANSI)."""
-    s = str(s)
-    return s + (" " * max(0, width - visible_len(s)))
-
-def _table(rows, headers):
-    cols = len(headers)
-    rows = normalize_rows(rows, cols, fill="-")
-
-    # Calcular anchos usando longitud visible (sin ANSI)
-    widths = [len(h) for h in headers]
-    for r in rows:
-        for i in range(cols):
-            widths[i] = max(widths[i], visible_len(r[i]))
-
-    def line(sep="-", cross="+"):
-        return cross + cross.join(sep * (w + 2) for w in widths) + cross
-
-    out = []
-    out.append(line("-"))
-    out.append("| " + " | ".join(headers[i].ljust(widths[i]) for i in range(cols)) + " |")
-    out.append(line("="))
-    for r in rows:
-        out.append("| " + " | ".join(pad_visible(r[i], widths[i]) for i in range(cols)) + " |")
-    out.append(line("-"))
-    return "\n".join(out)
-
+# ------------------ Menú: ver stock (PING) ------------------
 
 def ver_stock_ping(timeout_s=1.5):
-    # Broadcast lógico: PING a todos los conectados
     with clients_lock:
-        snapshot = list(clients.items())  # (cid, info)
+        snapshot = list(clients.items())
 
     if not snapshot:
         print("No hay etiquetas conectadas.")
         return
 
-    rid = str(int(time.time() * 1000))  # request id
+    rid = str(int(time.time() * 1000))
     with ping_lock:
         ping_responses[rid] = {}
 
-    # Enviar PING
     for cid, info in snapshot:
         try:
             send_line(info["conn"], f"PING {rid}")
         except:
             pass
 
-    # Esperar respuestas
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         time.sleep(0.05)
 
     with ping_lock:
         resp = ping_responses.get(rid, {})
-        # Limpieza básica para no crecer
         del ping_responses[rid]
 
     headers = ["CID", "IP:PUERTO", "ESTADO", "ID", "TEMP", "TIPO", "UBIC", "PRECIO"]
-
-    # Preparar tabla “bonita”
     rows = []
+
     for cid, info in snapshot:
         a = info["addr"]
         ipport = f"{a[0]}:{a[1]}"
 
         if cid not in resp:
-            # --- CAMBIO: 8 columnas ---
             rows.append([str(cid), ipport, c("NO RESP", "31"), "-", "-", "-", "-", "-"])
             continue
 
         status = resp[cid]["status"]
 
         if status == "EMPTY":
-            # --- CAMBIO: 8 columnas ---
             rows.append([str(cid), ipport, c("VACÍA", "33"), "-", "-", "-", "-", "-"])
-
         elif status == "DATA":
             data_json = resp[cid]["data"] or "{}"
             try:
@@ -346,11 +402,8 @@ def ver_stock_ping(timeout_s=1.5):
                     f'{float(d.get("Precio", 0.0)):.2f}'
                 ])
             except:
-                # --- CAMBIO: 8 columnas ---
                 rows.append([str(cid), ipport, c("MAL JSON", "31"), "-", "-", "-", "-", "-"])
-
         else:
-            # --- CAMBIO: 8 columnas ---
             rows.append([str(cid), ipport, c(status, "35"), "-", "-", "-", "-", "-"])
 
     clear()
@@ -359,12 +412,66 @@ def ver_stock_ping(timeout_s=1.5):
     print(_table(rows, headers))
 
 
+# ------------------ Menú: consultar CSV ------------------
+
+def consultar_csv():
+    while True:
+        print("\n--- CONSULTA DE REGISTROS ---")
+        print("1) Ver movimientos.csv")
+        print("2) Ver ventas.csv")
+        print("3) Resumen de ganancias (ventas)")
+        print("0) Volver")
+        op = input("Opción: ").strip()
+
+        if op == "1":
+            headers, rows = read_last_rows(MOV_CSV, limit=25)
+            clear()
+            print(c("=== MOVIMIENTOS (últimos 25) ===", "36"))
+            if not rows:
+                print("No hay datos aún (movimientos.csv no existe o está vacío).")
+            else:
+                table_headers = headers
+                table_rows = [[r.get(h, "") for h in table_headers] for r in rows]
+                print(_table(table_rows, table_headers))
+
+        elif op == "2":
+            headers, rows = read_last_rows(VEN_CSV, limit=25)
+            clear()
+            print(c("=== VENTAS (últimos 25) ===", "36"))
+            if not rows:
+                print("No hay datos aún (ventas.csv no existe o está vacío).")
+            else:
+                table_headers = headers
+                table_rows = [[r.get(h, "") for h in table_headers] for r in rows]
+                print(_table(table_rows, table_headers))
+
+        elif op == "3":
+            headers, rows = read_last_rows(VEN_CSV, limit=10_000)
+            total = 0.0
+            for r in rows:
+                try:
+                    total += float(str(r.get("precio", "0")).replace(",", "."))
+                except:
+                    pass
+            clear()
+            print(c("=== RESUMEN DE GANANCIAS ===", "36"))
+            print(f"Ventas registradas: {len(rows)}")
+            print(f"Total (€): {total:.2f}")
+
+        elif op == "0":
+            return
+        else:
+            print("Opción no válida.")
+
+
+# ------------------ Menú principal ------------------
+
 def menu_loop():
     while True:
         print("\n--- MENÚ SERVIDOR ---")
         print("1) Agregar una etiqueta (configurar NodeMCU conectado)")
         print("2) Ver stock (PING a todas las etiquetas)")
-        print("3) Ver clientes conectados (local)")
+        print("3) Consultar registros (CSV)")
         print("0) Salir")
         op = input("Opción: ").strip()
 
@@ -373,7 +480,7 @@ def menu_loop():
         elif op == "2":
             ver_stock_ping()
         elif op == "3":
-            print_clients()
+            consultar_csv()
         elif op == "0":
             print("Saliendo.")
             break
