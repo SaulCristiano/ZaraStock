@@ -1,96 +1,185 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <SPI.h>
 #include <Adafruit_PN532.h>
 
+// ------- WIFI / SERVER -------
+const char* ssid = "WifiR";
+const char* password = "12345678";
+const char* serverIP = "10.220.115.231";
+const uint16_t serverPort = 5000;
+WiFiClient client;
+
+// ------- NFC -------
 #define SDA_PIN 21
 #define SCL_PIN 22
-
 Adafruit_PN532 nfc(SDA_PIN, SCL_PIN);
 
-// --- Debounce ---
-static bool stablePresent = false;     // estado "confirmado" (debounced)
-static bool lastRawPresent = false;    // última lectura cruda
+// ROLE del lector: "BOX" o "DOOR"
+const char* NFC_ROLE = "BOX";  // <--- CAMBIA ESTO EN EL OTRO ESP32
+
+// --- Debounce NFC ---
+static bool stablePresent = false;
+static bool lastRawPresent = false;
 static uint32_t lastChangeMs = 0;
+const uint32_t DEBOUNCE_MS = 250;
+const uint16_t POLL_TIMEOUT_MS = 50;
 
-const uint32_t DEBOUNCE_MS = 250;      // ajusta (200-500 suele ir bien)
-const uint16_t POLL_TIMEOUT_MS = 50;   // lectura rápida, no bloqueante
-
-// Para recordar el último UID leído (opcional, por si hay falsos flancos)
 static uint8_t lastUid[7];
 static uint8_t lastUidLen = 0;
 static bool hasLastUid = false;
 
+// --- Petición de lectura UID desde servidor ---
+static bool waitingUid = false;
+static String waitingRid = "";
+
+// -------- Helpers TCP --------
+void enviarLinea(const String& s) {
+  if (client.connected()) client.print(s + "\n");
+}
+
+bool conectarServidor() {
+  Serial.print("Conectando al servidor ");
+  Serial.print(serverIP); Serial.print(":"); Serial.println(serverPort);
+  if (client.connect(serverIP, serverPort)) {
+    Serial.println("✅ Conectado!");
+    // Anunciar rol
+    enviarLinea(String("ROLE NFC ") + NFC_ROLE);
+    return true;
+  }
+  Serial.println("❌ No conectado.");
+  return false;
+}
+
+void asegurarConexion() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!client.connected()) {
+    client.stop();
+    conectarServidor();
+  }
+}
+
+// -------- Helpers NFC --------
 bool sameUid(const uint8_t* a, uint8_t aLen, const uint8_t* b, uint8_t bLen) {
   if (aLen != bLen) return false;
   for (uint8_t i = 0; i < aLen; i++) if (a[i] != b[i]) return false;
   return true;
 }
 
-void printUid(const uint8_t *uid, uint8_t uidLength) {
-  Serial.print("UID: ");
+String uidToHex(const uint8_t* uid, uint8_t uidLength) {
+  String out;
   for (uint8_t i = 0; i < uidLength; i++) {
-    if (uid[i] < 0x10) Serial.print("0"); // bonito: 0A en vez de A
-    Serial.print(uid[i], HEX);
+    if (uid[i] < 0x10) out += "0";
+    out += String(uid[i], HEX);
   }
-  Serial.println();
+  out.toUpperCase();
+  return out;
+}
+
+// -------- Parse líneas servidor --------
+void procesarLineaServidor(String line) {
+  line.trim();
+  if (!line.length()) return;
+
+  // PING rid -> PONG rid NFC BOX
+  if (line.startsWith("PING ")) {
+    String rid = line.substring(5); rid.trim();
+    enviarLinea(String("PONG ") + rid + " NFC " + NFC_ROLE);
+    return;
+  }
+
+  // READUID rid -> activar modo "esperar próximo UID"
+  if (line.startsWith("READUID ")) {
+    waitingRid = line.substring(8);
+    waitingRid.trim();
+    waitingUid = true;
+    Serial.print("📥 READUID recibido. Esperando tag... RID=");
+    Serial.println(waitingRid);
+    return;
+  }
+
+  // Mensajes varios
+  Serial.print("📥 ");
+  Serial.println(line);
+}
+
+void leerServidor() {
+  while (client.connected() && client.available()) {
+    String line = client.readStringUntil('\n');
+    procesarLineaServidor(line);
+  }
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(300);
+
+  Serial.println("\nConectando a WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi conectada.");
+  Serial.println(WiFi.localIP());
+
+  conectarServidor();
 
   Serial.println("\nIniciando PN532 (I2C)...");
   nfc.begin();
 
   uint32_t versiondata = nfc.getFirmwareVersion();
   if (!versiondata) {
-    Serial.println("No se encontró PN532. Revisa configuración y cableado.");
-    while (true) { delay(10); }
+    Serial.println("No se encontró PN532. Revisa cableado.");
+    while (true) delay(10);
   }
-
   nfc.SAMConfig();
-  Serial.println("Listo. Acerca un tag NFC para leer su UID...");
+  Serial.println("✅ PN532 listo.");
 }
 
 void loop() {
+  asegurarConexion();
+  leerServidor();
+
   uint8_t uid[7];
   uint8_t uidLength = 0;
 
-  // Lectura cruda: ¿hay tag ahora mismo?
   bool rawPresent = nfc.readPassiveTargetID(
     PN532_MIFARE_ISO14443A, uid, &uidLength, POLL_TIMEOUT_MS
   );
 
-  // Detectar cambios crudos
   uint32_t now = millis();
   if (rawPresent != lastRawPresent) {
     lastRawPresent = rawPresent;
     lastChangeMs = now;
   }
 
-  // Si el estado crudo se ha mantenido estable DEBOUNCE_MS, lo aceptamos
   if ((now - lastChangeMs) >= DEBOUNCE_MS && rawPresent != stablePresent) {
     stablePresent = rawPresent;
 
-    // Flanco de entrada: ausente -> presente
+    // entrada
     if (stablePresent) {
-      // Aquí uid/uidLength vienen de la lectura cruda actual.
-      // Opcional: evita duplicado si fuera el mismo UID por un “rebote” raro.
       if (!hasLastUid || !sameUid(uid, uidLength, lastUid, lastUidLen)) {
-        printUid(uid, uidLength);
+        String hex = uidToHex(uid, uidLength);
+        Serial.print("UID detectado: ");
+        Serial.println(hex);
+
         memcpy(lastUid, uid, uidLength);
         lastUidLen = uidLength;
         hasLastUid = true;
+
+        // Si el servidor lo pidió, contestar UNA vez
+        if (waitingUid && client.connected()) {
+          enviarLinea(String("UID ") + waitingRid + " " + hex);
+          Serial.print("📤 Enviado UID al servidor. RID=");
+          Serial.println(waitingRid);
+          waitingUid = false;
+          waitingRid = "";
+        }
       }
+    } else {
+      hasLastUid = false;
+      lastUidLen = 0;
     }
-    // Flanco de salida: presente -> ausente
-else {
-  // Al retirar el tag, “olvidamos” el último UID
-  // para permitir que el mismo tag vuelva a disparar al acercarlo otra vez.
-  hasLastUid = false;
-  lastUidLen = 0;
-}
-
   }
-
-  // No delay bloqueante. Puedes hacer otras cosas aquí.
 }
