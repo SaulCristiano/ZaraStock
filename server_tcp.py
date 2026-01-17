@@ -18,7 +18,8 @@ next_tag_id = 1
 
 # Para recopilar respuestas al PING (rid -> {cid: payload})
 ping_lock = threading.Lock()
-ping_responses = {}  # rid -> dict(cid -> dict(status, data_json_or_none, raw))
+ping_cv = threading.Condition(ping_lock)
+ping_responses = {}  # rid -> dict(cid -> dict(status, data, raw))
 
 
 # ------------------ Utilidades ------------------
@@ -160,7 +161,7 @@ def process_message(client_id: int, msg: str):
 
     print(f"[{now_ts()}] [{addr}] {msg}")
 
-    # ----- PING/PONG para ver stock -----
+    # ----- PING/PONG -----
     if msg.startswith("PONG "):
         parts = msg.split(" ", 3)  # PONG rid STATUS [rest]
         if len(parts) >= 3:
@@ -172,27 +173,25 @@ def process_message(client_id: int, msg: str):
             if status == "DATA" and rest:
                 data_json = rest
 
-            with ping_lock:
-                if rid not in ping_responses:
-                    ping_responses[rid] = {}
+            with ping_cv:
+                ping_responses.setdefault(rid, {})
                 ping_responses[rid][client_id] = {
                     "status": status,
                     "data": data_json,
                     "raw": msg
                 }
+                ping_cv.notify_all()
         return
 
-    # ----- Alta (ACK) -----
+    # ----- ACK -----
     if msg.startswith("ACK"):
         return
 
-    # ----- Reset manual -----
+    # ----- RESET -----
     if msg.startswith("RESET"):
-        # No hace falta guardar; el broadcast ya lo verá.
         return
 
     # ----- Movimiento -----
-    # Formato: MOVE {json}
     if msg.startswith("MOVE "):
         payload = msg[5:].strip()
         try:
@@ -216,7 +215,6 @@ def process_message(client_id: int, msg: str):
         return
 
     # ----- Venta -----
-    # Formato: SOLD {json}
     if msg.startswith("SOLD "):
         payload = msg[5:].strip()
         try:
@@ -237,7 +235,6 @@ def process_message(client_id: int, msg: str):
             print(f"[{now_ts()}] [!] SOLD mal formado: {e}")
         return
 
-    # Otros mensajes
     return
 
 
@@ -257,13 +254,60 @@ def acceptor_thread():
             clients[cid] = {
                 "conn": conn,
                 "addr": addr,
-                "configured": False,
+                "configured": False,  # ya NO es fuente de verdad
                 "last_seen": time.time(),
                 "buffer": b"",
                 "tag_data": None,
             }
         t = threading.Thread(target=handle_client, args=(cid,), daemon=True)
         t.start()
+
+
+# ------------------ POLLING GLOBAL (la clave del refactor) ------------------
+
+def poll_tags(timeout_s: float = 3.0):
+    """
+    Hace un 'broadcast lógico' PING a todos los conectados y devuelve:
+      - snapshot: lista de (cid, info) en el momento del ping
+      - resp: dict cid -> {status, data, raw} con respuestas recibidas
+      - rid: request id
+    """
+    with clients_lock:
+        snapshot = list(clients.items())
+
+    if not snapshot:
+        return [], {}, None
+
+    rid = str(int(time.time() * 1000))
+    expected = {cid for cid, _ in snapshot}
+
+    with ping_cv:
+        ping_responses[rid] = {}
+
+    # enviar PING
+    for cid, info in snapshot:
+        try:
+            send_line(info["conn"], f"PING {rid}")
+        except:
+            pass
+
+    deadline = time.time() + timeout_s
+    with ping_cv:
+        while True:
+            got = set(ping_responses.get(rid, {}).keys())
+            if got >= expected:
+                break
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            ping_cv.wait(timeout=remaining)
+
+        resp = ping_responses.get(rid, {})
+        ping_responses.pop(rid, None)
+
+    return snapshot, resp, rid
 
 
 # ------------------ Menú: alta ------------------
@@ -286,29 +330,36 @@ def input_float(prompt):
 def agregar_etiqueta():
     global next_tag_id
 
-    with clients_lock:
-        vacios = [cid for cid, info in clients.items() if not info["configured"]]
-
-    if not vacios:
-        print("No hay etiquetas VACÍAS conectadas. Enciende una y conéctala primero.")
+    snapshot, resp, rid = poll_tags(timeout_s=3.0)
+    if not snapshot:
+        print("No hay etiquetas conectadas.")
         return
 
-    print("\nEtiquetas vacías disponibles:")
-    with clients_lock:
-        for cid in vacios:
-            a = clients[cid]["addr"]
+    # Filtrar solo las EMPTY (en tiempo real)
+    empty_cids = []
+    for cid, _info in snapshot:
+        if cid in resp and resp[cid]["status"] == "EMPTY":
+            empty_cids.append(cid)
+
+    if not empty_cids:
+        print("No hay etiquetas VACÍAS ahora mismo (según PING).")
+        return
+
+    print(f"\nEtiquetas vacías disponibles (PING rid={rid}):")
+    for cid, info in snapshot:
+        if cid in empty_cids:
+            a = info["addr"]
             print(f"  [{cid}] {a[0]}:{a[1]}")
 
     while True:
         try:
-            cid = int(input("Elige el client_id al que asignar esta etiqueta: ").strip())
+            cid = int(input("Elige el CID al que asignar esta etiqueta: ").strip())
         except:
             print("Introduce un número válido.")
             continue
-        with clients_lock:
-            if cid in clients and not clients[cid]["configured"]:
-                break
-        print("Ese client_id no existe o ya está configurado.")
+        if cid in empty_cids:
+            break
+        print("Ese CID no es válido o no está VACÍO según el último PING.")
 
     temporada = input_choice("Temporada (Invierno/Verano): ", {"Invierno", "Verano"})
     tipo = input_choice("Tipo (Gorra/Camiseta/Pantalones/Calcetines): ",
@@ -324,11 +375,14 @@ def agregar_etiqueta():
         "ID": tag_id,
         "Temporada": temporada,
         "Tipo": tipo,
-        "Ubicacion": ubicacion,
+        "Ubicacion": "almacén", # ubicacion 
         "Precio": precio
     }
 
     with clients_lock:
+        if cid not in clients:
+            print("Esa etiqueta se ha desconectado justo ahora.")
+            return
         conn = clients[cid]["conn"]
 
     payload = json.dumps(tag, ensure_ascii=False)
@@ -336,41 +390,23 @@ def agregar_etiqueta():
 
     try:
         send_line(conn, cmd)
+        # esto ya es solo “decorativo”; la verdad la da el PING
         with clients_lock:
-            clients[cid]["configured"] = True
-            clients[cid]["tag_data"] = tag
-        print(f"✅ Etiqueta asignada al cliente [{cid}] -> ID={tag_id}")
+            if cid in clients:
+                clients[cid]["configured"] = True
+                clients[cid]["tag_data"] = tag
+        print(f"✅ Etiqueta asignada a CID [{cid}] -> ID={tag_id}")
     except Exception as e:
         print("❌ No se pudo enviar al cliente:", e)
 
 
 # ------------------ Menú: ver stock (PING) ------------------
 
-def ver_stock_ping(timeout_s=1.5):
-    with clients_lock:
-        snapshot = list(clients.items())
-
+def ver_stock_ping(timeout_s=3.0):
+    snapshot, resp, rid = poll_tags(timeout_s=timeout_s)
     if not snapshot:
         print("No hay etiquetas conectadas.")
         return
-
-    rid = str(int(time.time() * 1000))
-    with ping_lock:
-        ping_responses[rid] = {}
-
-    for cid, info in snapshot:
-        try:
-            send_line(info["conn"], f"PING {rid}")
-        except:
-            pass
-
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        time.sleep(0.05)
-
-    with ping_lock:
-        resp = ping_responses.get(rid, {})
-        del ping_responses[rid]
 
     headers = ["CID", "IP:PUERTO", "ESTADO", "ID", "TEMP", "TIPO", "UBIC", "PRECIO"]
     rows = []
@@ -408,7 +444,7 @@ def ver_stock_ping(timeout_s=1.5):
 
     clear()
     print(c("=== STOCK EN VIVO (PING A TODAS LAS ETIQUETAS) ===", "36"))
-    print(f"RID: {rid}   Respuestas en ~{timeout_s:.1f}s   Hora: {now_ts()}\n")
+    print(f"RID: {rid}   Timeout: {timeout_s:.1f}s   Hora: {now_ts()}\n")
     print(_table(rows, headers))
 
 
@@ -430,9 +466,8 @@ def consultar_csv():
             if not rows:
                 print("No hay datos aún (movimientos.csv no existe o está vacío).")
             else:
-                table_headers = headers
-                table_rows = [[r.get(h, "") for h in table_headers] for r in rows]
-                print(_table(table_rows, table_headers))
+                table_rows = [[r.get(h, "") for h in headers] for r in rows]
+                print(_table(table_rows, headers))
 
         elif op == "2":
             headers, rows = read_last_rows(VEN_CSV, limit=25)
@@ -441,12 +476,11 @@ def consultar_csv():
             if not rows:
                 print("No hay datos aún (ventas.csv no existe o está vacío).")
             else:
-                table_headers = headers
-                table_rows = [[r.get(h, "") for h in table_headers] for r in rows]
-                print(_table(table_rows, table_headers))
+                table_rows = [[r.get(h, "") for h in headers] for r in rows]
+                print(_table(table_rows, headers))
 
         elif op == "3":
-            headers, rows = read_last_rows(VEN_CSV, limit=10_000)
+            headers, rows = read_last_rows(VEN_CSV, limit=100000)
             total = 0.0
             for r in rows:
                 try:
@@ -469,7 +503,7 @@ def consultar_csv():
 def menu_loop():
     while True:
         print("\n--- MENÚ SERVIDOR ---")
-        print("1) Agregar una etiqueta (configurar NodeMCU conectado)")
+        print("1) Agregar una etiqueta (usa PING y muestra solo VACÍAS)")
         print("2) Ver stock (PING a todas las etiquetas)")
         print("3) Consultar registros (CSV)")
         print("0) Salir")
