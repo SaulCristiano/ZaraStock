@@ -552,7 +552,7 @@ def ver_stock_ping(timeout_s=3.0):
         print("No hay etiquetas conectadas.")
         return
 
-    headers = ["CID", "IP:PUERTO", "ESTADO", "ID", "TEMP", "TIPO", "UBIC", "PRECIO"]
+    headers = ["CID", "IP:PUERTO", "ESTADO", "ID", "TEMP", "TIPO", "UBIC", "UID", "PRECIO"]
     rows = []
 
     for cid, info in snapshot:
@@ -564,7 +564,7 @@ def ver_stock_ping(timeout_s=3.0):
             nfc_role = clients.get(cid, {}).get("nfc_role", "")
         
         if role == "NFC":
-            rows.append([str(cid), ipport, c("NFC", "36"), "-", "-", "-", c(nfc_role, "35"), "-"])
+            rows.append([str(cid), ipport, c("NFC", "36"), "-", "-", "-", c(nfc_role, "36"), "-"])
             continue
 
 
@@ -590,6 +590,7 @@ def ver_stock_ping(timeout_s=3.0):
                     str(d.get("Tipo", "")),
                     #str(d.get("Ubicacion", "")),
                     color_ubicacion(str(d.get("Ubicacion", ""))),
+                    str(d.get("UID","")),
                     f'{float(d.get("Precio", 0.0)):.2f}'
                 ])
             except:

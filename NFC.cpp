@@ -4,9 +4,9 @@
 #include <Adafruit_PN532.h>
 
 // ------- WIFI / SERVER -------
-const char* ssid = "WifiR";
-const char* password = "12345678";
-const char* serverIP = "10.220.115.231";
+const char* ssid = "PILOLO_DE_ARRIBA";
+const char* password = "AAAAAAAAAA1111111111";
+const char* serverIP = "192.168.1.84";
 const uint16_t serverPort = 5000;
 WiFiClient client;
 
@@ -16,7 +16,7 @@ WiFiClient client;
 Adafruit_PN532 nfc(SDA_PIN, SCL_PIN);
 
 // ROLE del lector: "CAJA" o "Puerta"
-const char* NFC_ROLE = "CAJA";  // <--- CAMBIA ESTO EN EL OTRO ESP32
+const char* NFC_ROLE = "BOX";  // <--- CAMBIA ESTO EN EL OTRO ESP32
 
 // --- Debounce NFC ---
 static bool stablePresent = false;

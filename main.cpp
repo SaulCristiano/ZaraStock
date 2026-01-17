@@ -32,6 +32,7 @@ struct Etiqueta {
   String tipo = "";
   String ubicacion = "";
   float precio = 0.0f;
+  String uid = "";
 };
 
 Etiqueta etiqueta;
@@ -145,6 +146,7 @@ void aplicarSET(const String& json) {
   String tipo = extraerStringJSON(json, "Tipo");
   String ubicacion = extraerStringJSON(json, "Ubicacion");
   float precio = extraerFloatJSON(json, "Precio");
+  String uid = extraerStringJSON(json, "UID");
 
   // Guardar en la etiqueta
   etiqueta.id = id;
@@ -152,7 +154,9 @@ void aplicarSET(const String& json) {
   etiqueta.tipo = tipo;
   etiqueta.ubicacion = ubicacion;
   etiqueta.precio = precio;
-  etiqueta.configurada = (id >= 0 && temporada.length() > 0 && tipo.length() > 0 && ubicacion.length() > 0);
+  etiqueta.uid = uid;
+  etiqueta.configurada = (id >= 0 && temporada.length() > 0 && tipo.length() > 0 && ubicacion.length() > 0 && uid.length() > 0);
+  
 
   Serial.println("\n✅ ETIQUETA CONFIGURADA:");
   Serial.print("ID: "); Serial.println(etiqueta.id);
@@ -160,6 +164,8 @@ void aplicarSET(const String& json) {
   Serial.print("Tipo: "); Serial.println(etiqueta.tipo);
   Serial.print("Ubicacion: "); Serial.println(etiqueta.ubicacion);
   Serial.print("Precio: "); Serial.println(etiqueta.precio, 2);
+  Serial.print("UID: "); Serial.println(etiqueta.uid);
+
 
   // Confirmación al servidor
   if (etiqueta.configurada) {
@@ -176,6 +182,7 @@ bool resetEtiqueta() {
   etiqueta.tipo = "";
   etiqueta.ubicacion = "";
   etiqueta.precio = 0.0f;
+  etiqueta.uid = "";
   return true; // ahora mismo siempre OK
 }
 
@@ -297,14 +304,13 @@ void enviarEventoBoton() {
 
 
 String etiquetaAJson() {
-  // OJO: esto es JSON sencillo (sin escapar comillas dentro de strings, no hace falta con tus valores)
   String json = "{";
   json += "\"ID\":" + String(etiqueta.id) + ",";
   json += "\"Temporada\":\"" + etiqueta.temporada + "\",";
   json += "\"Tipo\":\"" + etiqueta.tipo + "\",";
   json += "\"Ubicacion\":\"" + etiqueta.ubicacion + "\",";
-  // precio con 2 decimales
-  json += "\"Precio\":" + String(etiqueta.precio, 2);
+  json += "\"Precio\":" + String(etiqueta.precio, 2) + ",";   // ✅ coma aquí
+  json += "\"UID\":\"" + etiqueta.uid + "\"";                 // ✅ sin coma final
   json += "}";
   return json;
 }
