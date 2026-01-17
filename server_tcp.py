@@ -26,6 +26,12 @@ ack_lock = threading.Lock()
 ack_cv = threading.Condition(ack_lock)
 ack_responses = {}  # cid -> last_ack_id
 
+# Espera UID desde lector NFC (rid -> {"cid":int, "uid":str, "role":str})
+uid_lock = threading.Lock()
+uid_cv = threading.Condition(uid_lock)
+uid_responses = {}  # rid -> dict
+
+
 # ------------------ Utilidades ------------------
 
 def now_ts():
@@ -178,6 +184,31 @@ def process_message(client_id: int, msg: str):
 
     print(f"[{now_ts()}] [{addr}] {msg}")
 
+    # ROLE NFC BOX / ROLE NFC DOOR
+    if msg.startswith("ROLE "):
+        parts = msg.split()
+        # ROLE NFC BOX
+        if len(parts) >= 3 and parts[1] == "NFC":
+            nfc_role = parts[2].upper()
+            with clients_lock:
+                if client_id in clients:
+                    clients[client_id]["role"] = "NFC"
+                    clients[client_id]["nfc_role"] = nfc_role
+            print(f"[{now_ts()}] [i] Cliente {client_id} registrado como NFC {nfc_role}")
+        return
+
+    # UID <rid> <HEXUID>
+    if msg.startswith("UID "):
+        parts = msg.split()
+        if len(parts) >= 3:
+            rid = parts[1].strip()
+            hexuid = parts[2].strip().upper()
+            with uid_cv:
+                uid_responses[rid] = {"cid": client_id, "uid": hexuid}
+                uid_cv.notify_all()
+        return
+
+
     # ----- PING/PONG -----
     if msg.startswith("PONG "):
         parts = msg.split(" ", 3)  # PONG rid STATUS [rest]
@@ -288,6 +319,8 @@ def acceptor_thread():
                 "last_seen": time.time(),
                 "buffer": b"",
                 "tag_data": None,
+                "role": "TAG", # Por defecto NFC por el contrario
+                "nfc_role": None # Caja / Puerta
             }
         t = threading.Thread(target=handle_client, args=(cid,), daemon=True)
         t.start()
@@ -339,6 +372,14 @@ def poll_tags(timeout_s: float = 3.0):
 
     return snapshot, resp, rid
 
+# --------- Leer NFC de CAJA -----
+def get_nfc_reader(role_name: str):
+    role_name = role_name.upper()
+    with clients_lock:
+        for cid, info in clients.items():
+            if info.get("role") == "NFC" and info.get("nfc_role") == role_name:
+                return cid, info["conn"], info["addr"]
+    return None, None, None
 
 # ------------------ Menú: alta ------------------
 
@@ -403,6 +444,50 @@ def agregar_etiqueta():
     # ubicacion = input_choice("Ubicación inicial (almacén/tienda): ", {"almacén", "tienda"})
     precio = input_float("Precio (float): ")
 
+    clear()
+    print(c("=== ALTA / CONFIGURAR ETIQUETA (solo VACÍAS) ===", "36"))
+    print(f"RID: {rid}   Hora: {now_ts()}\n")
+    print("Acerque su etiqueta NFC al lector de CAJA para asignar UID...\n")
+
+    nfc_cid, nfc_conn, _ = get_nfc_reader("BOX")
+    if not nfc_conn:
+        print("❌ No hay lector NFC BOX conectado.")
+        return
+
+    read_rid = str(int(time.time() * 1000))
+
+    # limpiar posible residuo
+    with uid_cv:
+        uid_responses.pop(read_rid, None)
+
+    # pedir UID
+    try:
+        send_line(nfc_conn, f"READUID {read_rid}")
+    except Exception as e:
+        print("❌ No se pudo pedir UID al lector BOX:", e)
+        return
+
+    # esperar UID
+    uid_hex = None
+    deadline = time.time() + 10.0  # 10s para acercar el tag
+    with uid_cv:
+        while True:
+            got = uid_responses.get(read_rid)
+            if got:
+                uid_hex = got["uid"]
+                uid_responses.pop(read_rid, None)
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            uid_cv.wait(timeout=remaining)
+
+    if not uid_hex:
+        print("⚠️ No se detectó UID a tiempo.")
+        return
+
+    print(f"✅ UID capturado: {uid_hex}\n")
+
     with next_id_lock:
         tag_id = next_tag_id
         next_tag_id += 1
@@ -412,7 +497,8 @@ def agregar_etiqueta():
         "Temporada": temporada,
         "Tipo": tipo,
         "Ubicacion": "Almacén", # ubicacion
-        "Precio": precio
+        "Precio": precio,
+        "UID": uid_hex
     }
 
     with clients_lock:
@@ -472,6 +558,16 @@ def ver_stock_ping(timeout_s=3.0):
     for cid, info in snapshot:
         a = info["addr"]
         ipport = f"{a[0]}:{a[1]}"
+
+        with clients_lock:
+            role = clients.get(cid, {}).get("role", "TAG")
+            nfc_role = clients.get(cid, {}).get("nfc_role", "")
+        
+        if role == "NFC":
+            rows.append([str(cid), ipport, c("NFC", "36"), "-", "-", "-", c(nfc_role, "35"), "-"])
+            continue
+
+
 
         if cid not in resp:
             rows.append([str(cid), ipport, c("NO RESP", "31"), "-", "-", "-", "-", "-"])
