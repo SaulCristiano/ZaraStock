@@ -16,7 +16,7 @@ void responderPing(const String& rid);
 void procesarLineaServidor(String line);
 
 
-// ------- CONFIG BOTÓN (si lo quieres mantener) -------
+// ------- CONFIG BOTÓN  -------
 const int buttonPin = 0;   // GPIO0
 int lastButton = HIGH;
 unsigned long lastDebounceTime = 0;
@@ -243,9 +243,9 @@ void enviarEventoBoton() {
   }
 
   // 1) Si está en almacén -> pasa a tienda (MOVIMIENTO)
-  if (etiqueta.ubicacion == "almacén") {
+  if (etiqueta.ubicacion == "Almacén") {
     String from = etiqueta.ubicacion;
-    etiqueta.ubicacion = "tienda";
+    etiqueta.ubicacion = "Tienda";
 
     // Payload JSON para el servidor
     String payload = "{";
@@ -257,7 +257,7 @@ void enviarEventoBoton() {
     payload += "\"Precio\":" + String(etiqueta.precio, 2);
     payload += "}";
 
-    Serial.println("\n📦 MOVIMIENTO: almacén -> tienda");
+    Serial.println("\n📦 MOVIMIENTO: Almacén -> Tienda");
     if (client.connected()) {
       enviarLinea("MOVE " + payload);
     }
@@ -265,7 +265,7 @@ void enviarEventoBoton() {
   }
 
   // 2) Si está en tienda -> vendido (VENTA)
-  if (etiqueta.ubicacion == "tienda") {
+  if (etiqueta.ubicacion == "Tienda") {
     String payload = "{";
     payload += "\"ID\":" + String(etiqueta.id) + ",";
     payload += "\"Temporada\":\"" + etiqueta.temporada + "\",";
@@ -273,7 +273,7 @@ void enviarEventoBoton() {
     payload += "\"Precio\":" + String(etiqueta.precio, 2);
     payload += "}";
 
-    Serial.println("\n💰 VENTA: tienda -> vendido");
+    Serial.println("\n💰 VENTA: Tienda -> vendido");
     if (client.connected()) {
       enviarLinea("SOLD " + payload);
     }

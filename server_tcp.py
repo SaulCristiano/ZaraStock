@@ -21,6 +21,10 @@ ping_lock = threading.Lock()
 ping_cv = threading.Condition(ping_lock)
 ping_responses = {}  # rid -> dict(cid -> dict(status, data, raw))
 
+# Para esperar ACK de SET (cid -> {"id": int, "ok": bool, "ts": float})
+ack_lock = threading.Lock()
+ack_cv = threading.Condition(ack_lock)
+ack_responses = {}  # cid -> last_ack_id
 
 # ------------------ Utilidades ------------------
 
@@ -110,6 +114,19 @@ def _table(rows, headers):
     return "\n".join(out)
 
 
+# ------------------ COLOR Segun ubicación ------------------
+
+def color_ubicacion(ubi: str) -> str:
+    u = (ubi or "").strip().lower()
+    if  u == "almacén":
+        return c(ubi, "34")  # azul
+    if u == "tienda":
+        return c(ubi, "35")  # magenta
+    if u == "vendido":
+        return c(ubi, "32")  # verde (si algún día lo envías)
+    return ubi
+
+
 # ------------------ Networking ------------------
 
 def handle_client(client_id: int):
@@ -185,7 +202,20 @@ def process_message(client_id: int, msg: str):
 
     # ----- ACK -----
     if msg.startswith("ACK"):
+        # Esperado: "ACK ID=3"
+        ack_id = None
+        try:
+            i = msg.find("ID=")
+            if i != -1:
+                ack_id = int(msg[i+3:].strip())
+        except:
+            ack_id = None
+
+        with ack_cv:
+            ack_responses[client_id] = ack_id
+            ack_cv.notify_all()
         return
+
 
     # ----- RESET -----
     if msg.startswith("RESET"):
@@ -331,35 +361,41 @@ def agregar_etiqueta():
     global next_tag_id
 
     snapshot, resp, rid = poll_tags(timeout_s=3.0)
+
+    clear()
+    print(c("=== ALTA / CONFIGURAR ETIQUETA (solo VACÍAS) ===", "36"))
+    print(f"RID: {rid}   Hora: {now_ts()}\n")
+
     if not snapshot:
         print("No hay etiquetas conectadas.")
         return
 
     # Filtrar solo las EMPTY (en tiempo real)
-    empty_cids = []
-    for cid, _info in snapshot:
+    empty = []
+    for cid, info in snapshot:
         if cid in resp and resp[cid]["status"] == "EMPTY":
-            empty_cids.append(cid)
+            a = info["addr"]
+            empty.append([str(cid), f"{a[0]}:{a[1]}", c("VACÍA", "33")])
 
-    if not empty_cids:
+    if not empty:
         print("No hay etiquetas VACÍAS ahora mismo (según PING).")
         return
 
-    print(f"\nEtiquetas vacías disponibles (PING rid={rid}):")
-    for cid, info in snapshot:
-        if cid in empty_cids:
-            a = info["addr"]
-            print(f"  [{cid}] {a[0]}:{a[1]}")
+    # Tabla pequeña y limpia
+    headers = ["CID", "IP:PUERTO", "ESTADO"]
+    print(_table(empty, headers))
 
+    # Selección
+    empty_cids = {int(r[0]) for r in empty}
     while True:
         try:
-            cid = int(input("Elige el CID al que asignar esta etiqueta: ").strip())
+            cid = int(input("\nElige el CID al que asignar esta etiqueta: ").strip())
         except:
             print("Introduce un número válido.")
             continue
         if cid in empty_cids:
             break
-        print("Ese CID no es válido o no está VACÍO según el último PING.")
+        print("Ese CID no está en la lista de VACÍAS.")
 
     temporada = input_choice("Temporada (Invierno/Verano): ", {"Invierno", "Verano"})
     tipo = input_choice("Tipo (Gorra/Camiseta/Pantalones/Calcetines): ",
@@ -375,7 +411,7 @@ def agregar_etiqueta():
         "ID": tag_id,
         "Temporada": temporada,
         "Tipo": tipo,
-        "Ubicacion": "almacén", # ubicacion 
+        "Ubicacion": "Almacén", # ubicacion
         "Precio": precio
     }
 
@@ -390,14 +426,36 @@ def agregar_etiqueta():
 
     try:
         send_line(conn, cmd)
-        # esto ya es solo “decorativo”; la verdad la da el PING
-        with clients_lock:
-            if cid in clients:
-                clients[cid]["configured"] = True
-                clients[cid]["tag_data"] = tag
-        print(f"✅ Etiqueta asignada a CID [{cid}] -> ID={tag_id}")
+
+        # Esperar ACK del mismo CID y mismo ID
+        ok = False
+        deadline = time.time() + 2.0  # timeout 2s (ajústalo)
+
+        with ack_cv:
+            while True:
+                got = ack_responses.get(cid, None)
+                if got == tag_id:
+                    ok = True
+                    break
+
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+
+                ack_cv.wait(timeout=remaining)
+
+        if ok:
+            with clients_lock:
+                if cid in clients:
+                    clients[cid]["configured"] = True
+                    clients[cid]["tag_data"] = tag
+            print(f"\n✅ Etiqueta confirmada por ACK: CID [{cid}] -> ID={tag_id}")
+        else:
+            print(f"\n⚠️ SET enviado pero NO llegó ACK a tiempo (CID [{cid}] -> ID={tag_id})")
+
     except Exception as e:
-        print("❌ No se pudo enviar al cliente:", e)
+        print("\n❌ No se pudo enviar al cliente:", e)
+
 
 
 # ------------------ Menú: ver stock (PING) ------------------
@@ -434,7 +492,8 @@ def ver_stock_ping(timeout_s=3.0):
                     str(d.get("ID", "")),
                     str(d.get("Temporada", "")),
                     str(d.get("Tipo", "")),
-                    str(d.get("Ubicacion", "")),
+                    #str(d.get("Ubicacion", "")),
+                    color_ubicacion(str(d.get("Ubicacion", ""))),
                     f'{float(d.get("Precio", 0.0)):.2f}'
                 ])
             except:

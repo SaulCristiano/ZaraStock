@@ -15,8 +15,8 @@ WiFiClient client;
 #define SCL_PIN 22
 Adafruit_PN532 nfc(SDA_PIN, SCL_PIN);
 
-// ROLE del lector: "BOX" o "DOOR"
-const char* NFC_ROLE = "BOX";  // <--- CAMBIA ESTO EN EL OTRO ESP32
+// ROLE del lector: "CAJA" o "Puerta"
+const char* NFC_ROLE = "CAJA";  // <--- CAMBIA ESTO EN EL OTRO ESP32
 
 // --- Debounce NFC ---
 static bool stablePresent = false;
