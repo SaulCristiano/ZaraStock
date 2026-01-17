@@ -364,7 +364,7 @@ def agregar_etiqueta():
     temporada = input_choice("Temporada (Invierno/Verano): ", {"Invierno", "Verano"})
     tipo = input_choice("Tipo (Gorra/Camiseta/Pantalones/Calcetines): ",
                         {"Gorra", "Camiseta", "Pantalones", "Calcetines"})
-    ubicacion = input_choice("Ubicación inicial (almacén/tienda): ", {"almacén", "tienda"})
+    # ubicacion = input_choice("Ubicación inicial (almacén/tienda): ", {"almacén", "tienda"})
     precio = input_float("Precio (float): ")
 
     with next_id_lock:
