@@ -296,6 +296,22 @@ def process_message(client_id: int, msg: str):
             print(f"[{now_ts()}] [!] SOLD mal formado: {e}")
         return
 
+    # ----- SCAN desde NFC (caja) -----
+    # Formato: SCAN <HEXUID>
+    if msg.startswith("SCAN "):
+        hexuid = msg[5:].strip().upper()
+
+        # Solo aceptar SCAN si este cliente es NFC BOX
+        with clients_lock:
+            role = clients.get(client_id, {}).get("role", "TAG")
+            nfc_role = clients.get(client_id, {}).get("nfc_role", "")
+
+        if role != "NFC" or nfc_role != "BOX":
+            return
+
+        handle_scan_from_box(client_id, hexuid)
+        return
+
     return
 
 
@@ -380,6 +396,98 @@ def get_nfc_reader(role_name: str):
             if info.get("role") == "NFC" and info.get("nfc_role") == role_name:
                 return cid, info["conn"], info["addr"]
     return None, None, None
+
+# --------- Ver si el escaneo de CAJA es una prenda -----
+
+def handle_scan_from_box(nfc_cid: int, uid_hex: str):
+    """
+    Caja detecta UID -> el servidor hace poll_tags() -> busca etiqueta con UID
+    Si está en tienda: ordena venta (SELL) y responde con precio a la caja
+    Si está en almacén: alerta de ROBO
+    Si no existe: NO_MATCH
+    """
+    # 1) preguntar stock en vivo
+    snapshot, resp, rid = poll_tags(timeout_s=3.0)
+
+    # 2) buscar coincidencia por UID
+    match = None  # (tag_cid, data_dict)
+    for cid, info in snapshot:
+        # ignorar NFCs
+        with clients_lock:
+            if clients.get(cid, {}).get("role") == "NFC":
+                continue
+
+        r = resp.get(cid)
+        if not r or r.get("status") != "DATA":
+            continue
+
+        data_json = r.get("data") or "{}"
+        try:
+            d = json.loads(data_json)
+        except:
+            continue
+
+        tag_uid = str(d.get("UID", "")).strip().upper()
+        if tag_uid and tag_uid == uid_hex:
+            match = (cid, d)
+            break
+
+    # 3) responder a la caja
+    with clients_lock:
+        if nfc_cid not in clients:
+            return
+        nfc_conn = clients[nfc_cid]["conn"]
+
+    if not match:
+        try:
+            send_line(nfc_conn, f"PAY NO_MATCH UID={uid_hex}")
+        except:
+            pass
+        return
+
+    tag_cid, d = match
+    ubic = str(d.get("Ubicacion", "")).strip()
+    ubic_l = ubic.lower()
+    precio = d.get("Precio", 0.0)
+    try:
+        precio_f = float(precio)
+    except:
+        precio_f = 0.0
+
+    tag_id = d.get("ID", "")
+    tipo = d.get("Tipo", "")
+    temporada = d.get("Temporada", "")
+
+    # 4) si no está en tienda => “robo”
+    if ubic_l != "tienda":
+        try:
+            send_line(
+                nfc_conn,
+                f"PAY ALERT ROBO ID={tag_id} TIPO={tipo} TEMP={temporada} UBI={ubic} PRECIO={precio_f:.2f} UID={uid_hex}"
+            )
+        except:
+            pass
+        return
+
+    # 5) está en tienda => OK, cobrar y ordenar venta
+    try:
+        send_line(
+            nfc_conn,
+            f"PAY OK ID={tag_id} TIPO={tipo} TEMP={temporada} PRECIO={precio_f:.2f} UID={uid_hex}"
+        )
+    except:
+        pass
+
+    # Ordenar a la etiqueta que se venda (ella enviará SOLD y luego se vacía)
+    with clients_lock:
+        tag_conn = clients.get(tag_cid, {}).get("conn")
+
+    if tag_conn:
+        try:
+            send_line(tag_conn, "SELL")
+        except:
+            pass
+
 
 # ------------------ Menú: alta ------------------
 

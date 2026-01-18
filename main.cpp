@@ -226,6 +226,35 @@ void procesarLineaServidor(String line) {
     return;
   }
 
+    // SELL -> venta forzada desde la caja/servidor
+  if (line == "SELL") {
+    if (!etiqueta.configurada) {
+      enviarLinea("SELL_DENIED EMPTY");
+      return;
+    }
+
+    // Solo vender si está en tienda
+    if (etiqueta.ubicacion == "Tienda") {
+      String payload = "{";
+      payload += "\"ID\":" + String(etiqueta.id) + ",";
+      payload += "\"Temporada\":\"" + etiqueta.temporada + "\",";
+      payload += "\"Tipo\":\"" + etiqueta.tipo + "\",";
+      payload += "\"Precio\":" + String(etiqueta.precio, 2);
+      payload += "}";
+
+      // Enviar venta
+      enviarLinea("SOLD " + payload);
+
+      // Reset (vaciar)
+      resetEtiqueta();
+      enviarLinea("RESET OK AFTER_SALE");
+    } else {
+      enviarLinea("SELL_DENIED UBI=" + etiqueta.ubicacion);
+    }
+    return;
+  }
+
+
   // Si llega cualquier otra cosa:
   Serial.print("📥 Línea desconocida: ");
   Serial.println(line);

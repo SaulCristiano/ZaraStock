@@ -168,7 +168,7 @@ void loop() {
         lastUidLen = uidLength;
         hasLastUid = true;
 
-        // Si el servidor lo pidió, contestar UNA vez
+        // Si el servidor lo pidió (modo asignación UID), contestar UNA vez
         if (waitingUid && client.connected()) {
           enviarLinea(String("UID ") + waitingRid + " " + hex);
           Serial.print("📤 Enviado UID al servidor. RID=");
@@ -176,6 +176,12 @@ void loop() {
           waitingUid = false;
           waitingRid = "";
         }
+        // Si NO lo pidió, esto es modo CAJA: preguntar al servidor si es una prenda
+        else if (client.connected()) {
+          enviarLinea(String("SCAN ") + hex);
+          Serial.println("📤 SCAN enviado al servidor (modo caja).");
+        }
+
       }
     } else {
       hasLastUid = false;
