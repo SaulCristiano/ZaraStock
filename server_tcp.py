@@ -306,7 +306,12 @@ def process_message(client_id: int, msg: str):
             role = clients.get(client_id, {}).get("role", "TAG")
             nfc_role = clients.get(client_id, {}).get("nfc_role", "")
 
-        if role != "NFC" or nfc_role != "BOX":
+        if role == "NFC" and nfc_role == "BOX":
+            handle_scan_from_box(client_id, hexuid)
+            return
+        
+        if role == "NFC" and nfc_role == "DOOR":
+            handle_scan_from_door(client_id, hexuid)
             return
 
         handle_scan_from_box(client_id, hexuid)
@@ -487,6 +492,98 @@ def handle_scan_from_box(nfc_cid: int, uid_hex: str):
             send_line(tag_conn, "SELL")
         except:
             pass
+
+# --------- Ver si el escaneo de PUERTA es una prenda -----
+
+def handle_scan_from_door(nfc_cid: int, uid_hex: str):
+    snapshot, resp, rid = poll_tags(timeout_s=2.0)
+
+    # 1) buscar etiqueta con ese UID
+    found = None  # (tag_cid, tag_info, data_dict)
+    for cid, info in snapshot:
+        # saltar NFCs
+        with clients_lock:
+            if clients.get(cid, {}).get("role") == "NFC":
+                continue
+
+        r = resp.get(cid)
+        if not r or r.get("status") != "DATA":
+            continue
+
+        try:
+            d = json.loads(r.get("data") or "{}")
+        except:
+            continue
+
+        if str(d.get("UID", "")).strip().upper() == uid_hex:
+            found = (cid, info, d)
+            break
+
+    # 2) obtener conexión del lector puerta (para responderle)
+    with clients_lock:
+        if nfc_cid not in clients:
+            return
+        nfc_conn = clients[nfc_cid]["conn"]
+
+    # 3) si no existe esa UID
+    if not found:
+        try:
+            send_line(nfc_conn, f"DOOR NOTFOUND {uid_hex}")
+        except:
+            pass
+        return
+
+    # 4) si existe -> alternar ubicación
+    tag_cid, tag_info, d = found
+    ubic = str(d.get("Ubicacion", "")).strip()
+
+    if ubic == "Almacén":
+        new_ubic = "Tienda"
+    elif ubic == "Tienda":
+        new_ubic = "Almacén"
+    else:
+        try:
+            send_line(nfc_conn, f"DOOR ERROR {uid_hex} UBIC={ubic}")
+        except:
+            pass
+        return
+
+    # 5) enviar SET completo a la etiqueta (solo cambia Ubicacion)
+    d2 = dict(d)
+    d2["Ubicacion"] = new_ubic
+
+    try:
+        with clients_lock:
+            tag_conn = clients.get(tag_cid, {}).get("conn")
+        if tag_conn:
+            send_line(tag_conn, "SET " + json.dumps(d2, ensure_ascii=False))
+    except:
+        pass
+
+    # 6) log movimiento
+    try:
+        append_csv(
+            MOV_CSV,
+            headers=["timestamp", "ip", "id", "temporada", "tipo", "from", "to", "precio"],
+            row={
+                "timestamp": now_iso(),
+                "ip": tag_info["addr"][0],
+                "id": d.get("ID", ""),
+                "temporada": d.get("Temporada", ""),
+                "tipo": d.get("Tipo", ""),
+                "from": ubic,
+                "to": new_ubic,
+                "precio": d.get("Precio", ""),
+            }
+        )
+    except:
+        pass
+
+    # 7) responder al lector puerta
+    try:
+        send_line(nfc_conn, f"DOOR OK {uid_hex} {ubic}->{new_ubic}")
+    except:
+        pass
 
 
 # ------------------ Menú: alta ------------------
